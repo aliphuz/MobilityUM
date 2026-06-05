@@ -27,9 +27,9 @@ packages/
 .nuget/
 
 # ASP.NET Core
-appsettings.Development.json
-appsettings.Local.json
-appsettings.*.Local.json
+**/appsettings.Development.json
+**/appsettings.Local.json
+**/appsettings.*.Local.json
 secrets.json
 
 # JetBrains Rider

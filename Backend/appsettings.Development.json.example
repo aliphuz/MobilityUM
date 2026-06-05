@@ -1,0 +1,39 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+
+  "ConnectionStrings": {
+    "DefaultConnection": "Host=localhost;Port=5432;Database=mobility_db;Username=postgres;Password=YOUR_LOCAL_DB_PASSWORD"
+  },
+
+  "Jwt": {
+    "Key": "YOUR_LOCAL_JWT_SECRET_KEY",
+    "Issuer": "MobilitySystem",
+    "Audience": "MobilitySystemUsers",
+    "ExpiryHours": 8
+  },
+
+  "Mail": {
+    "From": "your-email@example.com",
+    "Host": "smtp.gmail.com",
+    "Port": "587",
+    "Username": "your-email@example.com",
+    "Password": "YOUR_EMAIL_PASSWORD"
+  },
+
+  "Azure": {
+    "FormRecognizer": {
+      "Endpoint": "https://<your-resource-name>.cognitiveservices.azure.com/",
+      "Key": "YOUR_FORM_RECOGNIZER_KEY"
+    },
+    "BlobStorage": {
+      "ConnectionString": "DefaultEndpointsProtocol=https;AccountName=<accountName>;AccountKey=YOUR_AZURE_STORAGE_ACCOUNT_KEY;EndpointSuffix=core.windows.net",
+      "ContainerName": "mobility-documents"
+    }
+  }
+}

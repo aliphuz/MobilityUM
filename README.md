@@ -41,6 +41,8 @@ This repository contains a mobility application system with a .NET backend and a
 ## Notes
 
 - The backend uses `appsettings.json` and `appsettings.Development.json` for configuration.
+- A sample development configuration is provided in `Backend/appsettings.Development.json.example`.
+- Do not commit `Backend/appsettings.Development.json` because it can contain local secrets.
 - The frontend is built with Vite and React.
 - Add any GitHub secrets or environment-specific settings locally as needed.
 
