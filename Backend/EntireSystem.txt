@@ -1,0 +1,1971 @@
+
+// ==========================================
+// File: Program.cs
+// ==========================================
+
+using System.Text;
+using Infrastructure.Persistence;
+using Infrastructure.Services;
+using Application.Interfaces;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Application.Services;
+using Microsoft.OpenApi.Models;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 10 * 1024 * 1024); // 10MB file upload limit
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo { Title = "Mobility System API", Version = "v1" });
+
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Description = "JWT Authorization header using the Bearer scheme. \r\n\r\n Enter 'Bearer' [space] and then your token in the text input below.\r\n\r\nExample: \"Bearer eyJhbGciOiJIUzI1NiIsInR...\"",
+        Name = "Authorization",
+        In = ParameterLocation.Header,
+        Type = SecuritySchemeType.ApiKey, // Note: ApiKey is sometimes more reliable in older Swashbuckle versions than Http
+        Scheme = "Bearer"
+    });
+    options.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                },
+                Scheme = "oauth2",
+                Name = "Bearer",
+                In = ParameterLocation.Header
+            },
+            new List<string>()
+        }
+    });
+});
+
+// Database
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// Services
+builder.Services.AddScoped<ITokenService, TokenService>();
+
+// JWT Authentication
+var jwtKey = builder.Configuration["Jwt:Key"]!;
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = builder.Configuration["Jwt:Issuer"],
+            ValidAudience = builder.Configuration["Jwt:Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+// CORS for React frontend
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", policy =>
+        policy.WithOrigins("http://localhost:5173", "http://127.0.0.1:5173","*")
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials());
+});
+
+builder.Services.AddScoped<IWorkflowService, WorkflowService>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+
+builder.Services.AddScoped<IOcrService, OcrService>();
+builder.Services.AddScoped<IBlobService, BlobService>();
+
+
+var app = builder.Build();
+
+app.UseSwagger();
+app.UseSwaggerUI();
+app.UseCors("AllowFrontend");
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+app.Run();
+
+// ==========================================
+// File: ApplicationController.cs
+// ==========================================
+
+using System.Security.Claims;
+using Application.DTOs;
+using Application.Interfaces;
+using Domain.Entities;
+using Domain.Enums;
+using Infrastructure.Persistence;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace API.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+[Authorize]
+public class ApplicationsController : ControllerBase
+{
+    private readonly AppDbContext _db;
+    private readonly IWorkflowService _workflow;
+    private readonly INotificationService _notification;
+
+    public ApplicationsController(
+        AppDbContext db,
+        IWorkflowService workflow,
+        INotificationService notification)
+    {
+        _db = db;
+        _workflow = workflow;
+        _notification = notification;
+    }
+
+    private Guid CurrentUserId => Guid.Parse(
+        User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+
+    // POST /api/applications — Student submits application
+ // POST /api/applications — Student submits application
+    [HttpPost]
+    [Authorize(Roles = "Student")]
+    public async Task<IActionResult> Submit(CreateApplicationDto dto)
+    {
+        var program = await _db.MobilityPrograms.FindAsync(dto.ProgramId);
+        if (program == null) return NotFound("Program not found.");
+        if (!program.IsActive) return BadRequest("Program is no longer active.");
+
+        var existing = await _db.MobilityApplications
+            .AnyAsync(a => a.StudentId == CurrentUserId
+                        && a.ProgramId == dto.ProgramId);
+        if (existing) return BadRequest("You already applied to this program.");
+
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == CurrentUserId);
+
+        if (profile == null)
+            return BadRequest("You must set up your profile before applying.");
+
+        // Calculate the required expiry date in UTC
+        var requiredValidity = program.ApplicationDeadline.ToUniversalTime().AddMonths(6);
+
+        // Check if they have at least ONE document that is uploaded AND valid
+        bool hasValidPassport = profile.PassportUploaded && profile.PassportExpiry >= requiredValidity;
+        bool hasValidVisa = profile.VisaUploaded && profile.VisaExpiry >= requiredValidity;
+
+        // If NEITHER document is valid (or they haven't uploaded anything), block the application
+        if (!hasValidPassport && !hasValidVisa)
+        {
+            return BadRequest(
+                $"You must provide either a valid passport OR a valid visa to apply. " +
+                $"The document must be valid until at least {requiredValidity:dd MMM yyyy} " +
+                $"(6 months after the programme deadline). Please update your profile.");
+        }
+
+        // All checks passed — create application
+        var application = new MobilityApplication
+        {
+            Id = Guid.NewGuid(),
+            StudentId = CurrentUserId,
+            ProgramId = dto.ProgramId,
+            Status = ApplicationStatus.Draft
+        };
+
+        var nextStatus = _workflow.GetNextStatus(
+            ApplicationStatus.Draft,
+            program.DurationType,
+            approve: true);
+
+        application.Status = nextStatus;
+
+        var log = new ApprovalLog
+        {
+            Id = Guid.NewGuid(),
+            ApplicationId = application.Id,
+            ActorId = CurrentUserId,
+            FromStatus = ApplicationStatus.Draft,
+            ToStatus = nextStatus,
+            Remark = "Application submitted by student."
+        };
+
+        _db.MobilityApplications.Add(application);
+        _db.ApprovalLogs.Add(log);
+        await _db.SaveChangesAsync();
+
+        await NotifyNextReviewer(nextStatus, application.Id);
+
+        return Ok(new { applicationId = application.Id, status = nextStatus.ToString() });
+    }
+    // GET /api/applications — Get applications (role-filtered)
+    [HttpGet]
+    public async Task<IActionResult> GetAll()
+    {
+        var role = User.FindFirstValue(ClaimTypes.Role);
+
+        var query = _db.MobilityApplications
+            .Include(a => a.Student)
+                .ThenInclude(s => s.Profile)
+            .Include(a => a.Program)
+            .Include(a => a.ApprovalLogs)
+                .ThenInclude(l => l.Actor)
+            .AsQueryable();
+
+        query = role switch
+        {
+            "Student" => query.Where(a => a.StudentId == CurrentUserId),
+            "AcademicAdvisor" => query.Where(a =>
+                a.Status == ApplicationStatus.Pending_AcademicAdvisor &&
+                a.Student.Profile != null &&
+                a.Student.Profile.AdvisorId == CurrentUserId),
+            "TdhepAdmin" => query,
+            _ => query.Where(a => false)
+        };
+
+        var result = await query
+            .OrderByDescending(a => a.UpdatedAt)
+            .Select(a => new ApplicationResponseDto
+            {
+                Id = a.Id,
+                StudentName = a.Student.FullName,
+                StudentEmail = a.Student.Email,
+                ProgramName = a.Program.Name,
+                DestinationCountry = a.Program.DestinationCountry,
+                DurationType = a.Program.DurationType.ToString(),
+                Status = a.Status.ToString(),
+                SubmittedAt = a.SubmittedAt,
+                UpdatedAt = a.UpdatedAt,
+                ApprovalLogs = a.ApprovalLogs
+                    .OrderBy(l => l.Timestamp)
+                    .Select(l => new ApprovalLogDto
+                    {
+                        ActorName = l.Actor.FullName,
+                        FromStatus = l.FromStatus.ToString(),
+                        ToStatus = l.ToStatus.ToString(),
+                        Remark = l.Remark,
+                        Timestamp = l.Timestamp
+                    }).ToList()
+            })
+            .ToListAsync();
+
+        return Ok(result);
+    }
+
+    // POST /api/applications/{id}/review — Advisor or TDHEP reviews
+    [HttpPost("{id}/review")]
+    [Authorize(Roles = "AcademicAdvisor,TdhepAdmin")]
+    public async Task<IActionResult> Review(Guid id, ReviewApplicationDto dto)
+    {
+        var application = await _db.MobilityApplications
+            .Include(a => a.Program)
+            .Include(a => a.Student)
+            .FirstOrDefaultAsync(a => a.Id == id);
+
+        if (application == null) return NotFound();
+
+        var role = User.FindFirstValue(ClaimTypes.Role);
+
+        // Guard: Advisor can only review Pending_AcademicAdvisor
+        if (role == "AcademicAdvisor" &&
+            application.Status != ApplicationStatus.Pending_AcademicAdvisor)
+            return BadRequest("This application is not pending your review.");
+
+        // Guard: TDHEP can only review Pending_TDHEP
+        if (role == "TdhepAdmin" &&
+            application.Status != ApplicationStatus.Pending_TDHEP)
+            return BadRequest("This application is not pending TDHEP review.");
+
+        var fromStatus = application.Status;
+        var nextStatus = _workflow.GetNextStatus(
+            fromStatus,
+            application.Program.DurationType,
+            dto.Approve);
+
+        application.Status = nextStatus;
+        application.UpdatedAt = DateTime.UtcNow;
+        if (!dto.Approve) application.RejectionRemark = dto.Remark;
+
+        var log = new ApprovalLog
+        {
+            Id = Guid.NewGuid(),
+            ApplicationId = application.Id,
+            ActorId = CurrentUserId,
+            FromStatus = fromStatus,
+            ToStatus = nextStatus,
+            Remark = dto.Remark
+        };
+
+        _db.ApprovalLogs.Add(log);
+        await _db.SaveChangesAsync();
+
+        // Notify student of outcome
+        await _notification.SendAsync(
+            application.Student.Email,
+            $"Mobility Application Update — {nextStatus}",
+            $"<p>Dear {application.Student.FullName},</p>" +
+            $"<p>Your application for <b>{application.Program.Name}</b> " +
+            $"has been updated to: <b>{nextStatus}</b>.</p>" +
+            $"<p>Remark: {dto.Remark ?? "None"}</p>");
+
+        return Ok(new { status = nextStatus.ToString() });
+    }
+
+    // POST /api/applications/{id}/override — TDHEP manual override
+    [HttpPost("{id}/override")]
+    [Authorize(Roles = "TdhepAdmin")]
+    public async Task<IActionResult> Override(Guid id, ReviewApplicationDto dto)
+    {
+        var application = await _db.MobilityApplications
+            .Include(a => a.Student)
+            .Include(a => a.Program)
+            .FirstOrDefaultAsync(a => a.Id == id);
+
+        if (application == null) return NotFound();
+        if (string.IsNullOrWhiteSpace(dto.Remark))
+            return BadRequest("A remark is required for manual overrides.");
+
+        var fromStatus = application.Status;
+        var toStatus = dto.Approve ? ApplicationStatus.Approved : ApplicationStatus.Rejected;
+
+        application.Status = toStatus;
+        application.UpdatedAt = DateTime.UtcNow;
+
+        _db.ApprovalLogs.Add(new ApprovalLog
+        {
+            Id = Guid.NewGuid(),
+            ApplicationId = application.Id,
+            ActorId = CurrentUserId,
+            FromStatus = fromStatus,
+            ToStatus = toStatus,
+            Remark = $"[MANUAL OVERRIDE] {dto.Remark}"
+        });
+
+        await _db.SaveChangesAsync();
+        return Ok(new { status = toStatus.ToString() });
+    }
+
+    private async Task NotifyNextReviewer(ApplicationStatus status, Guid applicationId)
+    {
+        if (status == ApplicationStatus.Pending_AcademicAdvisor)
+        {
+            var advisors = await _db.Users
+                .Where(u => u.Role == UserRole.AcademicAdvisor)
+                .ToListAsync();
+            foreach (var advisor in advisors)
+                await _notification.SendAsync(advisor.Email,
+                    "New Mobility Application Pending Your Review",
+                    $"<p>A new student mobility application requires your review.</p>" +
+                    $"<p>Please log in to the system to review it.</p>");
+        }
+        else if (status == ApplicationStatus.Pending_TDHEP)
+        {
+            var admins = await _db.Users
+                .Where(u => u.Role == UserRole.TdhepAdmin)
+                .ToListAsync();
+            foreach (var admin in admins)
+                await _notification.SendAsync(admin.Email,
+                    "New Mobility Application Pending TDHEP Review",
+                    $"<p>A mobility application has reached the TDHEP stage.</p>" +
+                    $"<p>Please log in to the system to review it.</p>");
+        }
+    }
+}
+
+// ==========================================
+// File: AuthController.cs
+// ==========================================
+
+using Application.DTOs;
+using Application.Interfaces;
+using Domain.Entities;
+using Domain.Enums;
+using Infrastructure.Persistence;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace API.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class AuthController : ControllerBase
+{
+    private readonly AppDbContext _db;
+    private readonly ITokenService _tokenService;
+
+    public AuthController(AppDbContext db, ITokenService tokenService)
+    {
+        _db = db;
+        _tokenService = tokenService;
+    }
+
+    [HttpPost("register")]
+    public async Task<IActionResult> Register(RegisterDto dto)
+    {
+        if (await _db.Users.AnyAsync(u => u.Email == dto.Email))
+            return BadRequest("Email already registered.");
+
+        if (!Enum.TryParse<UserRole>(dto.Role, out var role))
+            return BadRequest("Invalid role. Use: Student, AcademicAdvisor, TdhepAdmin");
+
+        var user = new User
+        {
+            Id = Guid.NewGuid(),
+            FullName = dto.FullName,
+            Email = dto.Email,
+            PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.Password),
+            Role = role
+        };
+
+        _db.Users.Add(user);
+        await _db.SaveChangesAsync();
+
+        var token = _tokenService.GenerateToken(user);
+
+        return Ok(new AuthResponseDto
+        {
+            Token = token,
+            FullName = user.FullName,
+            Email = user.Email,
+            Role = user.Role.ToString()
+        });
+    }
+
+    [HttpPost("login")]
+    public async Task<IActionResult> Login(LoginDto dto)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == dto.Email);
+
+        if (user == null || !BCrypt.Net.BCrypt.Verify(dto.Password, user.PasswordHash))
+            return Unauthorized("Invalid email or password.");
+
+        var token = _tokenService.GenerateToken(user);
+
+        return Ok(new AuthResponseDto
+        {
+            Token = token,
+            FullName = user.FullName,
+            Email = user.Email,
+            Role = user.Role.ToString()
+        });
+    }
+}
+
+// ==========================================
+// File: DocumentsController.cs
+// ==========================================
+
+using System.Security.Claims;
+using System.Text.Json;
+using Application.DTOs;
+using Application.Interfaces;
+using Domain.Entities;
+using Infrastructure.Persistence;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace API.Controllers;
+
+public class ConfirmOcrDto
+{
+    public string? FirstName { get; set; }
+    public string? LastName { get; set; }
+    public string? DocumentNumber { get; set; }
+    public string? DateOfBirth { get; set; }
+    public string? ExpiryDate { get; set; }
+    public string? Nationality { get; set; }
+}
+
+[ApiController]
+[Route("api/applications/{applicationId}/documents")]
+[Authorize(Roles = "Student")]
+public class DocumentsController : ControllerBase
+{
+    private readonly AppDbContext _db;
+    private readonly IOcrService _ocr;
+    private readonly IBlobService _blob;
+
+    public DocumentsController(
+        AppDbContext db,
+        IOcrService ocr,
+        IBlobService blob)
+    {
+        _db = db;
+        _ocr = ocr;
+        _blob = blob;
+    }
+
+    private Guid CurrentUserId => Guid.Parse(
+        User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+
+    // POST /api/applications/{id}/documents/upload
+    // Uploads file, runs OCR, returns extracted data for student to confirm
+    [HttpPost("upload")]
+    public async Task<IActionResult> Upload(
+        Guid applicationId,
+        IFormFile file,
+        [FromQuery] string documentType = "Passport")
+    {
+        var application = await _db.MobilityApplications
+            .FirstOrDefaultAsync(a => a.Id == applicationId
+                                   && a.StudentId == CurrentUserId);
+
+        if (application == null)
+            return NotFound("Application not found.");
+
+        if (file.Length == 0)
+            return BadRequest("File is empty.");
+
+        // Upload to Azure Blob
+        using var stream = file.OpenReadStream();
+        var blobUrl = await _blob.UploadAsync(
+            stream, file.FileName, file.ContentType);
+
+        // Run OCR if it's a passport
+        OcrResult? ocrResult = null;
+        if (documentType == "Passport")
+        {
+            stream.Position = 0;
+            using var ocrStream = file.OpenReadStream();
+            ocrResult = await _ocr.ExtractPassportDataAsync(
+                ocrStream, file.ContentType);
+        }
+
+        // Save document record (unconfirmed)
+        var document = new ApplicationDocument
+        {
+            Id = Guid.NewGuid(),
+            ApplicationId = applicationId,
+            DocumentType = documentType,
+            BlobUrl = blobUrl,
+            OcrDataJson = ocrResult?.RawJson,
+            IsOcrConfirmed = false
+        };
+
+        _db.ApplicationDocuments.Add(document);
+        await _db.SaveChangesAsync();
+
+        return Ok(new
+        {
+            documentId = document.Id,
+            blobUrl = document.BlobUrl,
+            ocrExtracted = ocrResult,
+            message = "Please review and confirm the extracted data."
+        });
+    }
+
+    // POST /api/applications/{id}/documents/{documentId}/confirm
+    // Student confirms (and optionally corrects) OCR data
+    [HttpPost("{documentId}/confirm")]
+    public async Task<IActionResult> ConfirmOcr(
+        Guid applicationId,
+        Guid documentId,
+        ConfirmOcrDto dto)
+    {
+        var document = await _db.ApplicationDocuments
+            .FirstOrDefaultAsync(d => d.Id == documentId
+                                   && d.ApplicationId == applicationId);
+
+        if (document == null) return NotFound("Document not found.");
+        if (document.IsOcrConfirmed)
+            return BadRequest("Document already confirmed.");
+
+        // Save confirmed (possibly corrected) data as JSON
+        document.OcrDataJson = JsonSerializer.Serialize(dto);
+        document.IsOcrConfirmed = true;
+
+        await _db.SaveChangesAsync();
+
+        return Ok(new { message = "Document confirmed successfully." });
+    }
+
+    // GET /api/applications/{id}/documents
+    // Get all documents for an application
+    [HttpGet]
+public async Task<IActionResult> GetAll(Guid applicationId)
+{
+    var documents = await _db.ApplicationDocuments
+        .Where(d => d.ApplicationId == applicationId)
+        .ToListAsync();
+
+    var result = documents.Select(d => new
+    {
+        d.Id,
+        d.DocumentType,
+        d.BlobUrl,
+        d.IsOcrConfirmed,
+        d.UploadedAt,
+        OcrData = d.OcrDataJson != null
+            ? JsonSerializer.Deserialize<object>(d.OcrDataJson, (JsonSerializerOptions?)null)
+            : null
+    });
+
+    return Ok(result);
+}
+}
+
+// ==========================================
+// File: ProfileController.cs
+// ==========================================
+
+using System.Globalization;
+using System.Security.Claims;
+using Application.DTOs;
+using Application.Interfaces;
+using Domain.Entities;
+using Infrastructure.Persistence;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace API.Controllers;
+
+[ApiController]
+[Route("api/profile")]
+[Authorize(Roles = "Student")]
+public class ProfileController : ControllerBase
+{
+    private readonly AppDbContext _db;
+    private readonly IBlobService _blob;
+    private readonly IOcrService _ocr;
+
+    public ProfileController(AppDbContext db, IBlobService blob, IOcrService ocr)
+    {
+        _db = db;
+        _blob = blob;
+        _ocr = ocr;
+    }
+
+    private Guid CurrentUserId => Guid.Parse(
+        User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+
+    // GET /api/profile
+    [HttpGet]
+    public async Task<IActionResult> Get()
+    {
+        var profile = await _db.StudentProfiles
+            .Include(p => p.Advisor)
+            .FirstOrDefaultAsync(p => p.StudentId == CurrentUserId);
+
+        if (profile == null)
+            return Ok(new StudentProfileDto());
+
+        return Ok(new StudentProfileDto
+        {
+            MatricNumber = profile.MatricNumber,
+            PhoneNumber = profile.PhoneNumber,
+            Faculty = profile.Faculty,
+            Programme = profile.Programme,
+            CurrentYear = profile.CurrentYear,
+            PassportNumber = profile.PassportNumber,
+            PassportNationality = profile.PassportNationality,
+            PassportExpiry = profile.PassportExpiry,
+            PassportBlobUrl = profile.PassportBlobUrl,
+            PassportUploaded = profile.PassportUploaded,
+            VisaType = profile.VisaType,
+            VisaExpiry = profile.VisaExpiry,
+            VisaBlobUrl = profile.VisaBlobUrl,
+            VisaUploaded = profile.VisaUploaded,
+            TranscriptBlobUrl = profile.TranscriptBlobUrl,
+            TranscriptUploaded = profile.TranscriptUploaded,
+            ProfilePhotoUrl = profile.ProfilePhotoUrl,
+            AdvisorId = profile.AdvisorId,
+            AdvisorName = profile.Advisor?.FullName,
+            AdvisorApprovalStatus = profile.AdvisorApprovalStatus,
+        });
+    }
+
+    // PUT /api/profile — update basic info
+    [HttpPut]
+    public async Task<IActionResult> Update(UpdateProfileDto dto)
+    {
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == CurrentUserId);
+
+        if (profile == null)
+        {
+            profile = new StudentProfile
+            {
+                Id = Guid.NewGuid(),
+                StudentId = CurrentUserId
+            };
+            _db.StudentProfiles.Add(profile);
+        }
+
+        if (dto.AdvisorId.HasValue)
+        {
+            var advisor = await _db.Users
+                .FirstOrDefaultAsync(u => u.Id == dto.AdvisorId.Value && u.Role == Domain.Enums.UserRole.AcademicAdvisor);
+            if (advisor == null)
+                return BadRequest("Advisor not found.");
+        }
+
+        var advisorChanged = profile.AdvisorId != dto.AdvisorId;
+
+        profile.MatricNumber = dto.MatricNumber;
+        profile.PhoneNumber = dto.PhoneNumber;
+        profile.Faculty = dto.Faculty;
+        profile.Programme = dto.Programme;
+        profile.CurrentYear = dto.CurrentYear;
+        profile.AdvisorId = dto.AdvisorId;
+
+        if (advisorChanged)
+            profile.AdvisorApprovalStatus = dto.AdvisorId.HasValue ? "Pending" : "Pending";
+
+        profile.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(new { message = "Profile updated." });
+    }
+
+    // POST /api/profile/photo — upload profile picture
+    [HttpPost("photo")]
+    public async Task<IActionResult> UploadProfilePhoto(IFormFile file)
+    {
+        if (file == null || file.Length == 0)
+            return BadRequest("File is empty.");
+
+        var profile = await GetOrCreateProfile();
+
+        using var stream = file.OpenReadStream();
+        var blobUrl = await _blob.UploadAsync(stream, file.FileName, file.ContentType);
+
+        profile.ProfilePhotoUrl = blobUrl;
+        profile.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(new { blobUrl, message = "Profile photo uploaded." });
+    }
+
+    // POST /api/profile/passport — upload + OCR passport
+    [HttpPost("passport")]
+    public async Task<IActionResult> UploadPassport(IFormFile file)
+    {
+        if (file.Length == 0) return BadRequest("File is empty.");
+
+        var profile = await GetOrCreateProfile();
+
+        using var stream = file.OpenReadStream();
+        var blobUrl = await _blob.UploadAsync(stream, file.FileName, file.ContentType);
+
+        profile.PassportBlobUrl = blobUrl;
+        profile.PassportUploaded = true;
+
+        OcrResult? ocrResult = null;
+        try
+        {
+            using var ocrStream = file.OpenReadStream();
+            ocrResult = await _ocr.ExtractPassportDataAsync(
+                ocrStream, file.ContentType);
+
+            if (!string.IsNullOrWhiteSpace(ocrResult.DocumentNumber))
+                profile.PassportNumber = ocrResult.DocumentNumber.Trim();
+
+            if (!string.IsNullOrWhiteSpace(ocrResult.Nationality))
+                profile.PassportNationality = ocrResult.Nationality.Trim();
+
+            if (TryParseOcrDate(ocrResult.ExpiryDate, out var expiry))
+                profile.PassportExpiry = expiry;
+        }
+        catch
+        {
+            // OCR failure should not prevent upload; profile still saves the document.
+        }
+
+        profile.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+
+        return Ok(new { blobUrl, message = "Passport uploaded.", ocrExtracted = ocrResult });
+    }
+
+    private static bool TryParseOcrDate(string? dateString, out DateTime date)
+    {
+        date = default;
+        if (string.IsNullOrWhiteSpace(dateString)) return false;
+
+        var formats = new[]
+        {
+            "yyyy-MM-dd", "yyyy/MM/dd", "MM/dd/yyyy", "dd/MM/yyyy",
+            "MM-dd-yyyy", "dd-MM-yyyy", "ddMMyyyy"
+        };
+
+        if (DateTime.TryParseExact(dateString, formats, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out date))
+        {
+            return true;
+        }
+
+        return DateTime.TryParse(dateString, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out date);
+    }
+
+    // PUT /api/profile/passport — save confirmed passport details
+    [HttpPut("passport")]
+    public async Task<IActionResult> UpdatePassport(UpdatePassportDto dto)
+    {
+        var profile = await GetOrCreateProfile();
+
+        profile.PassportNumber = dto.PassportNumber;
+        profile.PassportNationality = dto.PassportNationality;
+        
+        // FIX: Convert to UTC for PostgreSQL (Using ?. safely handles nulls)
+        profile.PassportExpiry = dto.PassportExpiry?.ToUniversalTime(); 
+        
+        profile.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(new { message = "Passport details saved." });
+    }
+
+    // POST /api/profile/visa — upload visa document
+    [HttpPost("visa")]
+    public async Task<IActionResult> UploadVisa(IFormFile file)
+    {
+        if (file.Length == 0) return BadRequest("File is empty.");
+
+        var profile = await GetOrCreateProfile();
+
+        using var stream = file.OpenReadStream();
+        var blobUrl = await _blob.UploadAsync(stream, file.FileName, file.ContentType);
+
+        profile.VisaBlobUrl = blobUrl;
+        profile.VisaUploaded = true;
+        profile.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(new { blobUrl, message = "Visa uploaded." });
+    }
+
+    // PUT /api/profile/visa — save visa details
+    [HttpPut("visa")]
+    public async Task<IActionResult> UpdateVisa(UpdateVisaDto dto)
+    {
+        var profile = await GetOrCreateProfile();
+
+        profile.VisaType = dto.VisaType;
+        
+        // FIX: Convert to UTC for PostgreSQL
+        profile.VisaExpiry = dto.VisaExpiry?.ToUniversalTime(); 
+        
+        profile.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(new { message = "Visa details saved." });
+    }
+
+    // POST /api/profile/transcript — upload transcript
+    [HttpPost("transcript")]
+    public async Task<IActionResult> UploadTranscript(IFormFile file)
+    {
+        if (file.Length == 0) return BadRequest("File is empty.");
+
+        var profile = await GetOrCreateProfile();
+
+        using var stream = file.OpenReadStream();
+        var blobUrl = await _blob.UploadAsync(stream, file.FileName, file.ContentType);
+
+        profile.TranscriptBlobUrl = blobUrl;
+        profile.TranscriptUploaded = true;
+        profile.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(new { blobUrl, message = "Transcript uploaded." });
+    }
+
+    // PUT /api/profile/{studentId}/advisor — assign an academic advisor to a student
+    [HttpPut("{studentId}/advisor")]
+    [Authorize(Roles = "TdhepAdmin")]
+    public async Task<IActionResult> AssignAdvisor(Guid studentId, AssignAdvisorDto dto)
+    {
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == studentId);
+
+        if (profile == null)
+            return NotFound("Student profile not found.");
+
+        var advisor = await _db.Users.FindAsync(dto.AdvisorId);
+        if (advisor == null || advisor.Role != Domain.Enums.UserRole.AcademicAdvisor)
+            return BadRequest("Advisor not found or invalid role.");
+
+        profile.AdvisorId = dto.AdvisorId;
+        profile.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+
+        return Ok(new { message = "Advisor assigned to student." });
+    }
+
+    // GET /api/profile/advisor/students — advisor can see assigned students
+    [HttpGet("advisor/students")]
+    [Authorize(Roles = "AcademicAdvisor")]
+    public async Task<IActionResult> GetAssignedStudents()
+    {
+        var students = await _db.StudentProfiles
+            .Include(p => p.Student)
+            .Where(p => p.AdvisorId == CurrentUserId)
+            .Select(p => new
+            {
+                p.StudentId,
+                StudentName = p.Student.FullName,
+                StudentEmail = p.Student.Email,
+                p.MatricNumber,
+                p.Faculty,
+                p.Programme,
+                p.PhoneNumber,
+                p.PassportNumber,
+                p.PassportExpiry,
+                p.VisaExpiry,
+                p.TranscriptUploaded,
+                p.PassportUploaded,
+                p.VisaUploaded,
+                p.ProfilePhotoUrl,
+                p.AdvisorApprovalStatus
+            })
+            .ToListAsync();
+
+        return Ok(students);
+    }
+
+    // POST /api/profile/advisor/students — add student by email to this advisor
+    [HttpPost("advisor/students")]
+    [Authorize(Roles = "AcademicAdvisor")]
+    public async Task<IActionResult> AddStudentByEmail(AddStudentByEmailDto dto)
+    {
+        if (string.IsNullOrWhiteSpace(dto.Email))
+            return BadRequest("Email is required.");
+
+        var student = await _db.Users
+            .FirstOrDefaultAsync(u => u.Email.ToLower() == dto.Email.Trim().ToLower() && u.Role == Domain.Enums.UserRole.Student);
+
+        if (student == null)
+            return NotFound("Student not found.");
+
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == student.Id);
+
+        if (profile == null)
+        {
+            profile = new StudentProfile
+            {
+                Id = Guid.NewGuid(),
+                StudentId = student.Id,
+                AdvisorId = CurrentUserId,
+                AdvisorApprovalStatus = "Accepted",
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+            _db.StudentProfiles.Add(profile);
+        }
+        else
+        {
+            profile.AdvisorId = CurrentUserId;
+            profile.AdvisorApprovalStatus = "Accepted";
+            profile.UpdatedAt = DateTime.UtcNow;
+        }
+
+        await _db.SaveChangesAsync();
+        return Ok(new { message = "Student added under your supervision." });
+    }
+
+    // PUT /api/profile/advisor/students/{studentId}/accept
+    [HttpPut("advisor/students/{studentId}/accept")]
+    [Authorize(Roles = "AcademicAdvisor")]
+    public async Task<IActionResult> AcceptStudent(Guid studentId)
+    {
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == studentId && p.AdvisorId == CurrentUserId);
+
+        if (profile == null)
+            return NotFound("Student not found under your supervision.");
+
+        profile.AdvisorApprovalStatus = "Accepted";
+        profile.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        return Ok(new { message = "Student accepted." });
+    }
+
+    // PUT /api/profile/advisor/students/{studentId}/reject
+    [HttpPut("advisor/students/{studentId}/reject")]
+    [Authorize(Roles = "AcademicAdvisor")]
+    public async Task<IActionResult> RejectStudent(Guid studentId)
+    {
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == studentId && p.AdvisorId == CurrentUserId);
+
+        if (profile == null)
+            return NotFound("Student not found under your supervision.");
+
+        profile.AdvisorApprovalStatus = "Rejected";
+        profile.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+        return Ok(new { message = "Student rejected." });
+    }
+
+    private async Task<StudentProfile> GetOrCreateProfile()
+    {
+        var profile = await _db.StudentProfiles
+            .FirstOrDefaultAsync(p => p.StudentId == CurrentUserId);
+
+        if (profile != null) return profile;
+
+        profile = new StudentProfile
+        {
+            Id = Guid.NewGuid(),
+            StudentId = CurrentUserId
+        };
+        _db.StudentProfiles.Add(profile);
+        return profile;
+    }
+}
+
+// ==========================================
+// File: ProgramsController.cs
+// ==========================================
+
+using System.Text;
+using Application.DTOs;
+using Application.Interfaces;
+using ClosedXML.Excel;
+using Domain.Entities;
+using Domain.Enums;
+using Infrastructure.Persistence;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace API.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class ProgramsController : ControllerBase
+{
+    private readonly AppDbContext _db;
+    private readonly IBlobService _blob;
+
+    public ProgramsController(AppDbContext db, IBlobService blob)
+    {
+        _db = db;
+        _blob = blob;
+    }
+
+    [HttpGet]
+    public async Task<IActionResult> GetAll()
+    {
+        var programs = await _db.MobilityPrograms
+            .Where(p => p.IsActive)
+            .OrderBy(p => p.ApplicationDeadline)
+            .ToListAsync();
+        return Ok(programs);
+    }
+
+    [HttpPost]
+    [Authorize(Roles = "TdhepAdmin")]
+    public async Task<IActionResult> Create(CreateProgramDto dto)
+    {
+        if (!Enum.TryParse<ProgramDurationType>(dto.DurationType, out var durationType))
+            return BadRequest("Invalid DurationType. Use: ShortTerm or LongTerm");
+
+        var program = new MobilityProgram
+        {
+            Id = Guid.NewGuid(),
+            Name = dto.Name,
+            DestinationCountry = dto.DestinationCountry,
+            HostUniversity = dto.HostUniversity,
+            DurationType = durationType,
+            Quota = dto.Quota,
+            ApplicationDeadline = dto.ApplicationDeadline
+        };
+
+        _db.MobilityPrograms.Add(program);
+        await _db.SaveChangesAsync();
+        return Ok(program);
+    }
+
+    [HttpDelete("{id}")]
+    [Authorize(Roles = "TdhepAdmin")]
+    public async Task<IActionResult> Deactivate(Guid id)
+    {
+        var program = await _db.MobilityPrograms.FindAsync(id);
+        if (program == null) return NotFound();
+        program.IsActive = false;
+        await _db.SaveChangesAsync();
+        return Ok();
+    }
+
+    // POST /api/programs/{id}/image — upload a program banner image
+    [HttpPost("{id}/image")]
+    [Authorize(Roles = "TdhepAdmin")]
+    public async Task<IActionResult> UploadProgramImage(Guid id, IFormFile file)
+    {
+        if (file == null || file.Length == 0)
+            return BadRequest("File is empty.");
+
+        var program = await _db.MobilityPrograms.FindAsync(id);
+        if (program == null) return NotFound();
+
+        using var stream = file.OpenReadStream();
+        var imageUrl = await _blob.UploadAsync(stream, file.FileName, file.ContentType);
+        program.ImageUrl = imageUrl;
+        await _db.SaveChangesAsync();
+
+        return Ok(new { imageUrl, message = "Program image uploaded." });
+    }
+
+    // GET /api/programs/{id}/students — accepted students for a program
+[HttpGet("{id}/students")]
+[Authorize(Roles = "TdhepAdmin,MobilityUniversity")]
+public async Task<IActionResult> GetAcceptedStudents(Guid id)
+{
+    var program = await _db.MobilityPrograms.FindAsync(id);
+    if (program == null) return NotFound();
+
+    var accepted = await _db.MobilityApplications
+        .Include(a => a.Student)
+            .ThenInclude(s => s.Profile)
+        .Where(a => a.ProgramId == id && a.Status == ApplicationStatus.Approved)
+        .Select(a => new
+        {
+            ApplicationId = a.Id,
+            StudentName = a.Student.FullName,
+            StudentEmail = a.Student.Email,
+            MatricNumber = a.Student.Profile != null ? a.Student.Profile.MatricNumber : null,
+            Faculty = a.Student.Profile != null ? a.Student.Profile.Faculty : null,
+            Programme = a.Student.Profile != null ? a.Student.Profile.Programme : null,
+            PhoneNumber = a.Student.Profile != null ? a.Student.Profile.PhoneNumber : null,
+            PassportNumber = a.Student.Profile != null ? a.Student.Profile.PassportNumber : null,
+            PassportExpiry = a.Student.Profile != null ? a.Student.Profile.PassportExpiry : null,
+            VisaExpiry = a.Student.Profile != null ? a.Student.Profile.VisaExpiry : null,
+            AdvisorName = a.Student.Profile != null && a.Student.Profile.Advisor != null ? a.Student.Profile.Advisor.FullName : null,
+            ApprovedAt = a.UpdatedAt,
+        })
+        .ToListAsync();
+
+    return Ok(new
+    {
+        Program = new
+        {
+            program.Id,
+            program.Name,
+            program.DestinationCountry,
+            program.HostUniversity,
+            program.DurationType,
+            program.Quota,
+            program.ApplicationDeadline,
+            program.ImageUrl
+        },
+        TotalAccepted = accepted.Count,
+        Students = accepted
+    });
+}
+
+[HttpGet("{id}/export")]
+[Authorize(Roles = "TdhepAdmin,MobilityUniversity")]
+public async Task<IActionResult> ExportAcceptedStudents(Guid id)
+{
+    var program = await _db.MobilityPrograms.FindAsync(id);
+    if (program == null) return NotFound();
+
+    var accepted = await _db.MobilityApplications
+        .Include(a => a.Student)
+            .ThenInclude(s => s.Profile)
+        .Where(a => a.ProgramId == id && a.Status == ApplicationStatus.Approved)
+        .Select(a => new
+        {
+            StudentName = a.Student.FullName,
+            StudentEmail = a.Student.Email,
+            MatricNumber = a.Student.Profile != null ? a.Student.Profile.MatricNumber : null,
+            Faculty = a.Student.Profile != null ? a.Student.Profile.Faculty : null,
+            Programme = a.Student.Profile != null ? a.Student.Profile.Programme : null,
+            PhoneNumber = a.Student.Profile != null ? a.Student.Profile.PhoneNumber : null,
+            PassportNumber = a.Student.Profile != null ? a.Student.Profile.PassportNumber : null,
+            PassportExpiry = a.Student.Profile != null ? a.Student.Profile.PassportExpiry : null,
+            VisaExpiry = a.Student.Profile != null ? a.Student.Profile.VisaExpiry : null,
+                AdvisorId = a.Student.Profile != null ? a.Student.Profile.AdvisorId : null,
+                AdvisorName = a.Student.Profile != null && a.Student.Profile.Advisor != null ? a.Student.Profile.Advisor.FullName : null
+            })
+            .ToListAsync();
+
+        using var workbook = new XLWorkbook();
+        var worksheet = workbook.Worksheets.Add("Accepted Students");
+
+        var headers = new[]
+        {
+            "Name", "Email", "Matric number", "Faculty", "Programme",
+            "Phone", "Passport number", "Passport expiry", "Visa expiry"
+        };
+
+        for (var i = 0; i < headers.Length; i++)
+        {
+            worksheet.Cell(1, i + 1).Value = headers[i];
+            worksheet.Cell(1, i + 1).Style.Font.Bold = true;
+        }
+
+        for (var rowIndex = 0; rowIndex < accepted.Count; rowIndex++)
+        {
+            var row = accepted[rowIndex];
+            var rowNumber = rowIndex + 2;
+            worksheet.Cell(rowNumber, 1).Value = row.StudentName;
+            worksheet.Cell(rowNumber, 2).Value = row.StudentEmail;
+            worksheet.Cell(rowNumber, 3).Value = row.MatricNumber;
+            worksheet.Cell(rowNumber, 4).Value = row.Faculty;
+            worksheet.Cell(rowNumber, 5).Value = row.Programme;
+            worksheet.Cell(rowNumber, 6).Value = row.PhoneNumber;
+            worksheet.Cell(rowNumber, 7).Value = row.PassportNumber;
+            worksheet.Cell(rowNumber, 8).Value = row.PassportExpiry;
+            worksheet.Cell(rowNumber, 9).Value = row.VisaExpiry;
+        }
+
+        worksheet.Columns().AdjustToContents();
+
+        using var memoryStream = new MemoryStream();
+        workbook.SaveAs(memoryStream);
+        memoryStream.Position = 0;
+
+        var fileName = System.IO.Path.GetFileNameWithoutExtension(program.Name)?.Replace(' ', '_') ?? "accepted-students";
+        return File(memoryStream.ToArray(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"{fileName}-accepted-students.xlsx");
+    }
+   
+}
+
+// ==========================================
+// File: ApplicationRespomseDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class ApplicationResponseDto
+{
+    public Guid Id { get; set; }
+    public string StudentName { get; set; } = string.Empty;
+    public string StudentEmail { get; set; } = string.Empty;
+    public string ProgramName { get; set; } = string.Empty;
+    public string DestinationCountry { get; set; } = string.Empty;
+    public string DurationType { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public DateTime SubmittedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+    public List<ApprovalLogDto> ApprovalLogs { get; set; } = new();
+}
+
+public class ApprovalLogDto
+{
+    public string ActorName { get; set; } = string.Empty;
+    public string FromStatus { get; set; } = string.Empty;
+    public string ToStatus { get; set; } = string.Empty;
+    public string? Remark { get; set; }
+    public DateTime Timestamp { get; set; }
+}
+
+// ==========================================
+// File: AuthResponseDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class AuthResponseDto
+{
+    public string Token { get; set; } = string.Empty;
+    public string FullName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string Role { get; set; } = string.Empty;
+}
+
+// ==========================================
+// File: CreateAppilcationDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class CreateApplicationDto
+{
+    public Guid ProgramId { get; set; }
+}
+
+// ==========================================
+// File: CreateProgramDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class CreateProgramDto
+{
+    public string Name { get; set; } = string.Empty;
+    public string DestinationCountry { get; set; } = string.Empty;
+    public string HostUniversity { get; set; } = string.Empty;
+    public string DurationType { get; set; } = string.Empty; // "ShortTerm" or "LongTerm"
+    public int Quota { get; set; }
+    public DateTime ApplicationDeadline { get; set; }
+}
+
+// ==========================================
+// File: LoginDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class LoginDto
+{
+    public string Email { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+}
+
+// ==========================================
+// File: RegisterDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class RegisterDto
+{
+    public string FullName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+    public string Role { get; set; } = string.Empty; // "Student", "AcademicAdvisor", "TdhepAdmin"
+}
+
+// ==========================================
+// File: ReviewApplicationDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class ReviewApplicationDto
+{
+    public bool Approve { get; set; }
+    public string? Remark { get; set; }
+}
+
+// ==========================================
+// File: StudentProfileDto.cs
+// ==========================================
+
+namespace Application.DTOs;
+
+public class StudentProfileDto
+{
+    public string? MatricNumber { get; set; }
+    public string? PhoneNumber { get; set; }
+    public string? Faculty { get; set; }
+    public string? Programme { get; set; }
+    public string? CurrentYear { get; set; }
+    public string? PassportNumber { get; set; }
+    public string? PassportNationality { get; set; }
+    public DateTime? PassportExpiry { get; set; }
+    public string? PassportBlobUrl { get; set; }
+    public bool PassportUploaded { get; set; }
+    public string? VisaType { get; set; }
+    public DateTime? VisaExpiry { get; set; }
+    public string? VisaBlobUrl { get; set; }
+    public bool VisaUploaded { get; set; }
+    public string? TranscriptBlobUrl { get; set; }
+    public bool TranscriptUploaded { get; set; }
+    public string? ProfilePhotoUrl { get; set; }
+    public Guid? AdvisorId { get; set; }
+    public string? AdvisorName { get; set; }
+    public string AdvisorApprovalStatus { get; set; } = "Pending";
+}
+
+public class UpdateProfileDto
+{
+    public string? MatricNumber { get; set; }
+    public string? PhoneNumber { get; set; }
+    public string? Faculty { get; set; }
+    public string? Programme { get; set; }
+    public string? CurrentYear { get; set; }
+    public Guid? AdvisorId { get; set; }
+}
+
+public class UpdatePassportDto
+{
+    public string? PassportNumber { get; set; }
+    public string? PassportNationality { get; set; }
+    public DateTime? PassportExpiry { get; set; }
+}
+
+public class UpdateVisaDto
+{
+    public string? VisaType { get; set; }
+    public DateTime? VisaExpiry { get; set; }
+}
+
+public class AssignAdvisorDto
+{
+    public Guid AdvisorId { get; set; }
+}
+
+public class AddStudentByEmailDto
+{
+    public string Email { get; set; } = string.Empty;
+}
+
+// ==========================================
+// File: IBlobService.cs
+// ==========================================
+
+namespace Application.Interfaces;
+
+public interface IBlobService
+{
+    Task<string> UploadAsync(Stream fileStream, string fileName, string contentType);
+    Task DeleteAsync(string fileName);
+}
+
+// ==========================================
+// File: INotificationService.cs
+// ==========================================
+
+namespace Application.Interfaces;
+
+public interface INotificationService
+{
+    Task SendAsync(string toEmail, string subject, string body);
+}
+
+// ==========================================
+// File: IOcrService.cs
+// ==========================================
+
+namespace Application.Interfaces;
+
+public class OcrResult
+{
+    public string? FirstName { get; set; }
+    public string? LastName { get; set; }
+    public string? DocumentNumber { get; set; }
+    public string? DateOfBirth { get; set; }
+    public string? ExpiryDate { get; set; }
+    public string? Nationality { get; set; }
+    public string? Sex { get; set; }
+    public string RawJson { get; set; } = string.Empty;
+}
+
+public interface IOcrService
+{
+    Task<OcrResult> ExtractPassportDataAsync(Stream fileStream, string contentType);
+}
+
+// ==========================================
+// File: ITokenService.cs
+// ==========================================
+
+using Domain.Entities;
+
+namespace Application.Interfaces;
+
+public interface ITokenService
+{
+    string GenerateToken(User user);
+}
+
+// ==========================================
+// File: IWorkflowService.cs
+// ==========================================
+
+using Domain.Entities;
+using Domain.Enums;
+
+namespace Application.Interfaces;
+
+public interface IWorkflowService
+{
+    ApplicationStatus GetNextStatus(ApplicationStatus current, ProgramDurationType durationType, bool approve);
+}
+
+// ==========================================
+// File: BlobService.cs
+// ==========================================
+
+using Application.Interfaces;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Microsoft.Extensions.Configuration;
+
+namespace Infrastructure.Services;
+
+public class BlobService : IBlobService
+{
+    private readonly BlobContainerClient _container;
+
+    public BlobService(IConfiguration config)
+    {
+        var connStr = config["Azure:BlobStorage:ConnectionString"]!;
+        var containerName = config["Azure:BlobStorage:ContainerName"]!;
+        _container = new BlobContainerClient(connStr, containerName);
+        _container.CreateIfNotExists(PublicAccessType.None);
+    }
+
+    public async Task<string> UploadAsync(
+        Stream fileStream, string fileName, string contentType)
+    {
+        var uniqueName = $"{Guid.NewGuid()}_{fileName}";
+        var blob = _container.GetBlobClient(uniqueName);
+
+        await blob.UploadAsync(fileStream, new BlobHttpHeaders
+        {
+            ContentType = contentType
+        });
+
+        return blob.Uri.ToString();
+    }
+
+    public async Task DeleteAsync(string fileName)
+    {
+        var blob = _container.GetBlobClient(fileName);
+        await blob.DeleteIfExistsAsync();
+    }
+}
+
+// ==========================================
+// File: NotificationService.cs
+// ==========================================
+
+using Application.Interfaces;
+using MailKit.Net.Smtp;
+using MailKit.Security;
+using Microsoft.Extensions.Configuration;
+using MimeKit;
+
+namespace Infrastructure.Services;
+
+public class NotificationService : INotificationService
+{
+    private readonly IConfiguration _config;
+
+    public NotificationService(IConfiguration config)
+    {
+        _config = config;
+    }
+
+    public async Task SendAsync(string toEmail, string subject, string body)
+    {
+        var message = new MimeMessage();
+        message.From.Add(MailboxAddress.Parse(_config["Mail:From"]!));
+        message.To.Add(MailboxAddress.Parse(toEmail));
+        message.Subject = subject;
+        message.Body = new TextPart("html") { Text = body };
+
+        using var smtp = new SmtpClient();
+        await smtp.ConnectAsync(_config["Mail:Host"]!, int.Parse(_config["Mail:Port"]!), SecureSocketOptions.StartTls);
+await smtp.AuthenticateAsync(_config["Mail:Username"]!, _config["Mail:Password"]!);
+        await smtp.SendAsync(message);
+        await smtp.DisconnectAsync(true);
+    }
+}
+
+// ==========================================
+// File: OcrService.cs
+// ==========================================
+
+using Application.Interfaces;
+using Azure;
+using Azure.AI.FormRecognizer.DocumentAnalysis;
+using Microsoft.Extensions.Configuration;
+using System.Text.Json;
+
+namespace Infrastructure.Services;
+
+public class OcrService : IOcrService
+{
+    private readonly DocumentAnalysisClient _client;
+
+    public OcrService(IConfiguration config)
+    {
+        var endpoint = config["Azure:FormRecognizer:Endpoint"]!;
+        var key = config["Azure:FormRecognizer:Key"]!;
+        _client = new DocumentAnalysisClient(
+            new Uri(endpoint),
+            new AzureKeyCredential(key));
+    }
+
+    public async Task<OcrResult> ExtractPassportDataAsync(
+        Stream fileStream, string contentType)
+    {
+        var operation = await _client.AnalyzeDocumentAsync(
+            WaitUntil.Completed,
+            "prebuilt-idDocument",
+            fileStream);
+
+        var result = operation.Value;
+        var doc = result.Documents.FirstOrDefault();
+
+        if (doc == null)
+            return new OcrResult { RawJson = "{}" };
+
+        string? GetField(string name) =>
+            doc.Fields.TryGetValue(name, out var f)
+                ? f.Content : null;
+
+        var ocrResult = new OcrResult
+        {
+            FirstName     = GetField("FirstName"),
+            LastName      = GetField("LastName"),
+            DocumentNumber= GetField("DocumentNumber"),
+            DateOfBirth   = GetField("DateOfBirth"),
+            ExpiryDate    = GetField("ExpiryDate"),
+            Nationality   = GetField("CountryRegion"),
+            Sex           = GetField("Sex"),
+        };
+
+        ocrResult.RawJson = JsonSerializer.Serialize(ocrResult);
+        return ocrResult;
+    }
+}
+
+// ==========================================
+// File: WorkflowService.cs
+// ==========================================
+
+using Application.Interfaces;
+using Domain.Enums;
+
+namespace Application.Services;
+
+public class WorkflowService : IWorkflowService
+{
+    public ApplicationStatus GetNextStatus(
+        ApplicationStatus current,
+        ProgramDurationType durationType,
+        bool approve)
+    {
+        if (!approve) return ApplicationStatus.Rejected;
+
+        return (current, durationType) switch
+        {
+            // Student submits long-term → goes to Academic Advisor
+            (ApplicationStatus.Draft, ProgramDurationType.LongTerm)
+                => ApplicationStatus.Pending_AcademicAdvisor,
+
+            // Student submits short-term → bypasses Advisor, goes directly to TDHEP
+            (ApplicationStatus.Draft, ProgramDurationType.ShortTerm)
+                => ApplicationStatus.Pending_TDHEP,
+
+            // Academic Advisor approves → goes to TDHEP
+            (ApplicationStatus.Pending_AcademicAdvisor, _)
+                => ApplicationStatus.Pending_TDHEP,
+
+            // TDHEP approves → fully approved
+            (ApplicationStatus.Pending_TDHEP, _)
+                => ApplicationStatus.Approved,
+
+            _ => throw new InvalidOperationException(
+                $"No valid transition from {current}")
+        };
+    }
+}
+
+// ==========================================
+// File: ApplicationDocument.cs
+// ==========================================
+
+namespace Domain.Entities;
+
+public class ApplicationDocument
+{
+    public Guid Id { get; set; }
+    public Guid ApplicationId { get; set; }
+    public string DocumentType { get; set; } = string.Empty; // "Passport", "Visa", "FlightTicket", etc.
+    public string BlobUrl { get; set; } = string.Empty;
+    public string? OcrDataJson { get; set; } // raw JSON from Azure OCR stored as JSONB
+    public bool IsOcrConfirmed { get; set; } = false;
+    public DateTime UploadedAt { get; set; } = DateTime.UtcNow;
+
+    public MobilityApplication Application { get; set; } = null!;
+}
+
+// ==========================================
+// File: ApprovalLog.cs
+// ==========================================
+
+using Domain.Enums;
+
+namespace Domain.Entities;
+
+public class ApprovalLog
+{
+    public Guid Id { get; set; }
+    public Guid ApplicationId { get; set; }
+    public Guid ActorId { get; set; }
+    public ApplicationStatus FromStatus { get; set; }
+    public ApplicationStatus ToStatus { get; set; }
+    public string? Remark { get; set; }
+    public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+
+    public MobilityApplication Application { get; set; } = null!;
+    public User Actor { get; set; } = null!;
+}
+
+// ==========================================
+// File: MobilityApplication.cs
+// ==========================================
+
+using Domain.Enums;
+
+namespace Domain.Entities;
+
+public class MobilityApplication
+{
+    public Guid Id { get; set; }
+    public Guid StudentId { get; set; }
+    public Guid ProgramId { get; set; }
+    public ApplicationStatus Status { get; set; } = ApplicationStatus.Draft;
+    public string? RejectionRemark { get; set; }
+    public DateTime SubmittedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public User Student { get; set; } = null!;
+    public MobilityProgram Program { get; set; } = null!;
+    public ICollection<ApplicationDocument> Documents { get; set; } = new List<ApplicationDocument>();
+    public ICollection<ApprovalLog> ApprovalLogs { get; set; } = new List<ApprovalLog>();
+}
+
+// ==========================================
+// File: MobilityProgram.cs
+// ==========================================
+
+using Domain.Enums;
+
+namespace Domain.Entities;
+
+public class MobilityProgram
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string DestinationCountry { get; set; } = string.Empty;
+    public string HostUniversity { get; set; } = string.Empty;
+    public ProgramDurationType DurationType { get; set; }
+    public int Quota { get; set; }
+    public DateTime ApplicationDeadline { get; set; }
+    public bool IsActive { get; set; } = true;
+    public string? ImageUrl { get; set; }
+
+    public ICollection<MobilityApplication> Applications { get; set; } = new List<MobilityApplication>();
+}
+
+// ==========================================
+// File: StudentProfile.cs
+// ==========================================
+
+namespace Domain.Entities;
+
+public class StudentProfile
+{
+    public Guid Id { get; set; }
+    public Guid StudentId { get; set; }
+    public string? MatricNumber { get; set; }
+    public string? PhoneNumber { get; set; }
+    public string? Faculty { get; set; }
+    public string? Programme { get; set; }
+    public string? CurrentYear { get; set; }
+
+    // Passport fields
+    public string? PassportNumber { get; set; }
+    public string? PassportNationality { get; set; }
+    public DateTime? PassportExpiry { get; set; }
+    public string? PassportBlobUrl { get; set; }
+    public bool PassportUploaded { get; set; } = false;
+
+    // Visa fields
+    public string? VisaType { get; set; }
+    public DateTime? VisaExpiry { get; set; }
+    public string? VisaBlobUrl { get; set; }
+    public bool VisaUploaded { get; set; } = false;
+
+    // Academic transcript
+    public string? TranscriptBlobUrl { get; set; }
+    public bool TranscriptUploaded { get; set; } = false;
+
+    // Student profile photo
+    public string? ProfilePhotoUrl { get; set; }
+
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public Guid? AdvisorId { get; set; }
+    public string AdvisorApprovalStatus { get; set; } = "Pending";
+    public User? Advisor { get; set; }
+
+    public User Student { get; set; } = null!;
+}
+
+// ==========================================
+// File: User.cs
+// ==========================================
+
+using Domain.Enums;
+
+namespace Domain.Entities;
+
+public class User
+{
+    public Guid Id { get; set; }
+    public string FullName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public UserRole Role { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    public ICollection<MobilityApplication> Applications { get; set; } = new List<MobilityApplication>();
+    public StudentProfile? Profile { get; set; }
+}
+
+// ==========================================
+// File: ApplicationStatus.cs
+// ==========================================
+
+namespace Domain.Enums;
+
+public enum ApplicationStatus
+{
+    Draft,
+    Pending_AcademicAdvisor,
+    Pending_TDHEP,
+    Approved,
+    Rejected
+}
+
+// ==========================================
+// File: ProgramDurationType.cs
+// ==========================================
+
+namespace Domain.Enums;
+
+public enum ProgramDurationType
+{
+    ShortTerm,
+    LongTerm
+}
+
+// ==========================================
+// File: UserRole.cs
+// ==========================================
+
+namespace Domain.Enums;
+
+public enum UserRole
+{
+    Student,
+    AcademicAdvisor,
+    TdhepAdmin,
+    MobilityUniversity
+}
+
+// ==========================================
+// File: AppDbContext.cs
+// ==========================================
+
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+
+namespace Infrastructure.Persistence;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+    public DbSet<User> Users => Set<User>();
+    public DbSet<MobilityProgram> MobilityPrograms => Set<MobilityProgram>();
+    public DbSet<MobilityApplication> MobilityApplications => Set<MobilityApplication>();
+    public DbSet<ApplicationDocument> ApplicationDocuments => Set<ApplicationDocument>();
+    public DbSet<ApprovalLog> ApprovalLogs => Set<ApprovalLog>();
+    public DbSet<StudentProfile> StudentProfiles => Set<StudentProfile>();
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Store OcrDataJson as PostgreSQL JSONB
+        modelBuilder.Entity<ApplicationDocument>()
+            .Property(d => d.OcrDataJson)
+            .HasColumnType("jsonb");
+
+        // Store enums as strings (readable in DB)
+        modelBuilder.Entity<User>()
+            .Property(u => u.Role)
+            .HasConversion<string>();
+
+        modelBuilder.Entity<MobilityApplication>()
+            .Property(a => a.Status)
+            .HasConversion<string>();
+
+        modelBuilder.Entity<MobilityProgram>()
+            .Property(p => p.DurationType)
+            .HasConversion<string>();
+
+        modelBuilder.Entity<ApprovalLog>()
+            .Property(l => l.FromStatus).HasConversion<string>();
+        modelBuilder.Entity<ApprovalLog>()
+            .Property(l => l.ToStatus).HasConversion<string>();
+
+        modelBuilder.Entity<StudentProfile>()
+            .HasOne(sp => sp.Student)
+            .WithOne(u => u.Profile)
+            .HasForeignKey<StudentProfile>(sp => sp.StudentId);
+
+        modelBuilder.Entity<StudentProfile>()
+            .HasOne(sp => sp.Advisor)
+            .WithMany()
+            .HasForeignKey(sp => sp.AdvisorId)
+            .OnDelete(DeleteBehavior.SetNull);
+    }
+}
+
+// ==========================================
+// File: TokenService.cs
+// ==========================================
+
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Application.Interfaces;
+using Domain.Entities;
+using Microsoft.Extensions.Configuration;
+using Microsoft.IdentityModel.Tokens;
+
+namespace Infrastructure.Services;
+
+public class TokenService : ITokenService
+{
+    private readonly IConfiguration _config;
+
+    public TokenService(IConfiguration config)
+    {
+        _config = config;
+    }
+
+    public string GenerateToken(User user)
+    {
+        var key = new SymmetricSecurityKey(
+            Encoding.UTF8.GetBytes(_config["Jwt:Key"]!));
+
+        var claims = new[]
+        {
+            new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+            new Claim(ClaimTypes.Email, user.Email),
+            new Claim(ClaimTypes.Name, user.FullName),
+            new Claim(ClaimTypes.Role, user.Role.ToString())
+        };
+
+        var token = new JwtSecurityToken(
+            issuer: _config["Jwt:Issuer"],
+            audience: _config["Jwt:Audience"],
+            claims: claims,
+            expires: DateTime.UtcNow.AddHours(
+                double.Parse(_config["Jwt:ExpiryHours"]!)),
+            signingCredentials: new SigningCredentials(
+                key, SecurityAlgorithms.HmacSha256)
+        );
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+}

@@ -1,0 +1,10 @@
+export default function Card({ children, style = {} }) {
+  return (
+    <div style={{
+      background: '#fff', border: '0.5px solid #e2e8f0',
+      borderRadius: 12, padding: '20px 24px', ...style
+    }}>
+      {children}
+    </div>
+  );
+}

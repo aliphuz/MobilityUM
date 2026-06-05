@@ -1,0 +1,78 @@
+# .NET build and user files
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.vcxproj.user
+*.ide*
+.vs/
+
+# Entity Framework metadata
+Migrations/Generated/
+
+# Visual Studio temporary files
+*.tmp
+*.temp
+*.log
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# ASP.NET Core
+appsettings.Development.json
+appsettings.Local.json
+appsettings.*.Local.json
+secrets.json
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# Node.js
+**/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+
+# Logs
+*.log
+
+# Build outputs
+**/bin/
+**/obj/
+**/dist/
+
+# Optional npm cache
+.npm
+
+# Vite
+frontend/.vite/
+
+# Coverage
+coverage/
+
+# Editor files
+*.swp
+*~
+
+# Local config
+local.settings.json
+
+# Generated files
+*.db
+*.sqlite
+
+# Ignore Visual Studio Code workspace settings
+.vscode/
