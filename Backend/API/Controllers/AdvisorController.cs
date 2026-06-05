@@ -98,6 +98,102 @@ public class AdvisorController : ControllerBase
         return Ok(result);
     }
 
+    // GET /api/advisor/requests
+    [HttpGet("requests")]
+    public async Task<IActionResult> GetRequestsCount()
+    {
+        var currentUserEmail = User.FindFirst(ClaimTypes.Email)?.Value;
+
+        if (string.IsNullOrEmpty(currentUserEmail))
+            return BadRequest("Advisor email claim not found.");
+
+        var count = await _db.StudentProfiles
+            .CountAsync(p => p.AdvisorEmail.ToLower() == currentUserEmail.Trim().ToLower() && p.AdvisorStatus == AdvisorStatus.Pending);
+
+        return Ok(count);
+    }
+
+    // GET /api/advisor/applications/pending
+    [HttpGet("applications/pending")]
+    public async Task<IActionResult> GetPendingApplications()
+    {
+        var currentUserEmail = User.FindFirst(ClaimTypes.Email)?.Value;
+
+        if (string.IsNullOrEmpty(currentUserEmail))
+            return BadRequest("Advisor email claim not found.");
+
+        var applications = await _db.MobilityApplications
+            .Include(a => a.Student)
+                .ThenInclude(s => s.Profile)
+            .Include(a => a.Program)
+            .Include(a => a.ApprovalLogs)
+                .ThenInclude(l => l.Actor)
+            .Where(a =>
+                a.Status == ApplicationStatus.Pending_AcademicAdvisor &&
+                a.Student.Profile != null &&
+                a.Student.Profile.AdvisorEmail.ToLower() == currentUserEmail.Trim().ToLower())
+            .OrderByDescending(a => a.UpdatedAt)
+            .ToListAsync();
+
+        var result = new List<ApplicationResponseDto>();
+        foreach (var a in applications)
+        {
+            var profile = a.Student.Profile;
+            PassportOcrResultDto? passportOcr = null;
+            TranscriptOcrResultDto? transcriptOcr = null;
+
+            if (profile != null)
+            {
+                if (profile.PassportOcrJson != null)
+                {
+                    try
+                    {
+                        passportOcr = JsonSerializer.Deserialize<PassportOcrResultDto>(profile.PassportOcrJson);
+                    }
+                    catch { }
+                }
+                if (profile.TranscriptOcrJson != null)
+                {
+                    try
+                    {
+                        transcriptOcr = JsonSerializer.Deserialize<TranscriptOcrResultDto>(profile.TranscriptOcrJson);
+                    }
+                    catch { }
+                }
+            }
+
+            result.Add(new ApplicationResponseDto
+            {
+                Id = a.Id,
+                StudentId = a.StudentId,
+                StudentName = a.Student.FullName,
+                StudentEmail = a.Student.Email,
+                ProgramName = a.Program.Name,
+                DestinationCountry = a.Program.DestinationCountry,
+                DurationType = a.Program.DurationType.ToString(),
+                Status = a.Status.ToString(),
+                SubmittedAt = a.SubmittedAt,
+                UpdatedAt = a.UpdatedAt,
+                StudentPassportOcrData = passportOcr,
+                StudentTranscriptOcrData = transcriptOcr,
+                ApprovalLogs = a.ApprovalLogs
+                    .OrderBy(l => l.Timestamp)
+                    .Select(l => new ApprovalLogDto
+                    {
+                        Id = l.Id,
+                        ActorName = l.Actor.FullName,
+                        ActorRole = l.Actor.Role.ToString(),
+                        FromStatus = l.FromStatus.ToString(),
+                        ToStatus = l.ToStatus.ToString(),
+                        Remark = l.Remark,
+                        Timestamp = l.Timestamp
+                    }).ToList()
+            });
+        }
+
+        return Ok(result);
+    }
+
     // POST /api/advisor/students/add
     [HttpPost("students/add")]
     public async Task<IActionResult> AddStudent(AddStudentRequestDto dto)
